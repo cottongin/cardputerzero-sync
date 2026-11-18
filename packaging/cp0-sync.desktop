@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Photo Sync
+Comment=Automatic photo sync to Mac over Tailscale
+Exec=/usr/bin/cp0-sync-ui
+Icon=/usr/share/APPLaunch/share/images/cp0-sync.png
+Terminal=false
+Categories=Utility;Network;

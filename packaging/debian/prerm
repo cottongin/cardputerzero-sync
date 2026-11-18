@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        if command -v systemctl >/dev/null 2>&1; then
+            if command -v loginctl >/dev/null 2>&1; then
+                for user_entry in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $2}'); do
+                    [ -n "$user_entry" ] || continue
+                    systemctl --machine="${user_entry}@.host" --user stop cp0-syncd.service >/dev/null 2>&1 || true
+                done
+            fi
+            systemctl --global disable cp0-syncd.service >/dev/null 2>&1 || true
+        fi
+        rm -rf /usr/lib/cp0-sync/cp0_syncd/__pycache__
+        ;;
+esac
+
+exit 0

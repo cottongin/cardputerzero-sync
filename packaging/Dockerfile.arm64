@@ -1,0 +1,31 @@
+FROM --platform=linux/arm64 debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    pkg-config \
+    libsqlite3-dev \
+    libfreetype-dev \
+    dpkg-dev \
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY device-ui /app/device-ui
+COPY device-daemon /app/device-daemon
+COPY mac-receiver /app/mac-receiver
+COPY packaging /app/packaging
+
+RUN rm -rf /app/device-ui/build /app/device-ui/build-arm64 \
+    && cmake -S /app/device-ui -B /app/device-ui/build-arm64 \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CXX_FLAGS_RELEASE="-O2" \
+        -DCP0_UI_BUILD_APP=ON \
+        -DCP0_UI_TARGET_DEVICE=ON \
+        -DCP0_UI_BUILD_TESTS=ON \
+    && cmake --build /app/device-ui/build-arm64 -j"$(nproc)" \
+    && ctest --test-dir /app/device-ui/build-arm64 --output-on-failure \
+    && /app/packaging/build-deb.sh --local --ui-bin /app/device-ui/build-arm64/cp0-sync-ui

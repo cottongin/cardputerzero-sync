@@ -1,0 +1,10 @@
+Package: cp0-sync
+Version: 1.0.0-m5stack1
+Section: utils
+Priority: optional
+Architecture: arm64
+Maintainer: CardputerZero Sync <noreply@local>
+Depends: python3 (>= 3.9), libsqlite3-0, libfreetype6
+Description: Automatic one-way photo sync daemon and LVGL companion UI for CardputerZero
+ Background systemd user daemon (cp0-syncd) and 320x170 companion UI
+ (cp0-sync-ui) for syncing photos over Tailscale to a Mac receiver.

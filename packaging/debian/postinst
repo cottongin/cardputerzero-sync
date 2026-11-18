@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --global enable cp0-syncd.service || true
+
+        if command -v loginctl >/dev/null 2>&1; then
+            for user_entry in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $2}'); do
+                [ -n "$user_entry" ] || continue
+                systemctl --machine="${user_entry}@.host" --user daemon-reload >/dev/null 2>&1 || true
+                systemctl --machine="${user_entry}@.host" --user restart cp0-syncd.service >/dev/null 2>&1 || true
+            done
+        fi
+    fi
+fi
+
+exit 0

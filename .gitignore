@@ -5,6 +5,8 @@ __pycache__/
 .pytest_cache/
 build/
 device-ui/build/
+device-ui/build-arm64/
 device-ui/deps/
+packaging/dist/
 *.deb
 .DS_Store
