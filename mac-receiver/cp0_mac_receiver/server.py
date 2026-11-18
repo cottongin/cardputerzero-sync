@@ -55,12 +55,15 @@ def is_allowed_client_ip(ip_str: str, tailscale_only: bool) -> bool:
 def _default_osascript_notifier(count: int, dest_root: Path) -> None:
     """Display a native macOS Notification Center banner via osascript."""
     noun = "photo" if count == 1 else "photos"
-    folder = dest_root.name.replace('"', '\\"')
-    message = f"Synced {count} {noun} to {folder}"
-    script = f'display notification "{message}" with title "CardputerZero Sync"'
+    message = f"Synced {count} {noun} to {dest_root.name}"
+    script = (
+        "on run argv\n"
+        '  display notification (item 1 of argv) with title "CardputerZero Sync"\n'
+        "end run"
+    )
     try:
         subprocess.run(
-            ["osascript", "-e", script],
+            ["osascript", "-e", script, message],
             check=False,
             capture_output=True,
             text=True,
