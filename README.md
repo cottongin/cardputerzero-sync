@@ -1,3 +1,6 @@
+> [!IMPORTANT]  
+> This project was developed entirely with AI coding assistance (Gemini 4 Argon) and has not undergone rigorous review. It is provided as-is and may require adjustments for other environments.
+
 # CardputerZero Photo Sync
 
 Automatic one-way background photo syncing from an **M5Stack CardputerZero** (Raspberry Pi CM0 / ARM64 Debian Linux) to a **Mac** over **Tailscale**.
