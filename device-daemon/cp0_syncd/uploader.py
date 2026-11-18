@@ -105,6 +105,8 @@ class Uploader:
 
     def wake(self, reset_backoff: bool = True, probe: bool = False) -> None:
         """Interrupt backoff sleep immediately and optionally trigger a /health probe."""
+        if reset_backoff:
+            self._store.set_meta("next_retry_ts", "0")
         with self._state_lock:
             if reset_backoff:
                 self._backoff_index = 0
@@ -112,27 +114,26 @@ class Uploader:
                 self._next_retry_deadline = 0.0
             if probe:
                 self._probe_requested = True
-        if reset_backoff:
-            self._store.set_meta("next_retry_ts", "0")
-        self._wake_event.set()
+            self._wake_event.set()
 
     def start(self) -> None:
         """Start the background upload loop thread."""
         if self._thread is not None and self._thread.is_alive():
             return
-        self._stop_event.clear()
         cfg = self._get_config()
-        if cfg.target_host.strip():
-            with self._state_lock:
+        with self._state_lock:
+            self._stop_event.clear()
+            if cfg.target_host.strip():
                 self._probe_requested = True
-        self._wake_event.set()
+            self._wake_event.set()
         self._thread = threading.Thread(target=self._run_loop, name="cp0-uploader", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         """Stop the background upload loop cleanly."""
-        self._stop_event.set()
-        self._wake_event.set()
+        with self._state_lock:
+            self._stop_event.set()
+            self._wake_event.set()
         if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(timeout=5.0)
         self._thread = None
@@ -142,7 +143,7 @@ class Uploader:
             with self._state_lock:
                 probe = self._probe_requested
                 self._probe_requested = False
-            self._wake_event.clear()
+                self._wake_event.clear()
 
             has_pending = self._store.next_pending() is not None
             if has_pending or probe:
@@ -150,17 +151,15 @@ class Uploader:
             else:
                 result = "idle"
 
-            if self._stop_event.is_set():
-                break
-            if self._wake_event.is_set():
+            with self._state_lock:
+                if self._stop_event.is_set():
+                    break
+                woken = self._wake_event.is_set() or self._probe_requested
+                wait_sec = max(1, self._current_delay) if result in ("offline", "paused") else 60.0
+            if woken:
                 continue
 
-            if result in ("offline", "paused"):
-                with self._state_lock:
-                    wait_sec = max(1, self._current_delay)
-                self._wake_event.wait(timeout=wait_sec)
-            else:
-                self._wake_event.wait(timeout=60.0)
+            self._wake_event.wait(timeout=wait_sec)
 
     def _reset_backoff(self) -> None:
         with self._state_lock:

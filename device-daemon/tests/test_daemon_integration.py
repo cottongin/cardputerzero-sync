@@ -711,6 +711,209 @@ class TestWatchersAndLinuxInotify(unittest.TestCase):
             finally:
                 db.close()
 
+    def test_recovers_interrupted_uploading_rows_on_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cam_dir = Path(tmp) / "Camera"
+            dest_root = Path(tmp) / "MacDest"
+            cam_dir.mkdir()
+            photo = cam_dir / "crashed_mid_upload.jpg"
+            photo.write_bytes(b"recovered-photo-payload")
+
+            mac_cfg = Path(tmp) / "mac.json"
+            save_mac_config(
+                MacConfig(
+                    dest_root=str(dest_root),
+                    listen_host="127.0.0.1",
+                    listen_port=0,
+                    notify_on_batch=False,
+                    tailscale_only=True,
+                ),
+                mac_cfg,
+            )
+            mac_srv = MacReceiverServer(mac_cfg)
+            mac_srv.start()
+            try:
+                cfg_path = Path(tmp) / "daemon.json"
+                db_path = Path(tmp) / "state.db"
+                sock_path = Path(tmp) / "cp0.sock"
+                save_daemon_config(
+                    DaemonConfig(
+                        target_host="127.0.0.1",
+                        target_port=mac_srv.server_port,
+                        watched_folders=[WatchedFolder(id="cam", path=str(cam_dir), label="Camera")],
+                    ),
+                    cfg_path,
+                )
+
+                # Simulate crash leaving row stuck in UPLOADING in state.db
+                pre_store = SyncStore(db_path)
+                try:
+                    pre_store.enqueue_file(
+                        "cam",
+                        str(photo),
+                        "crashed_mid_upload.jpg",
+                        len(b"recovered-photo-payload"),
+                        photo.stat().st_mtime_ns,
+                        compute_sha256(photo),
+                    )
+                    row = pre_store.next_pending()
+                    assert row is not None
+                    pre_store.mark_uploading(row["id"])
+                    self.assertIsNone(pre_store.next_pending())
+                finally:
+                    pre_store.close()
+
+                daemon = SyncDaemon(cfg_path, db_path, sock_path, watcher_poll_interval=0.05)
+                daemon.start()
+                try:
+                    self.assertTrue(_wait_until(lambda: (dest_root / "Camera" / "crashed_mid_upload.jpg").exists()))
+                    status = _send_ipc(sock_path, {"cmd": "status"})
+                    self.assertEqual(status["synced_count"], 1)
+                    self.assertEqual(status["pending_count"], 0)
+                finally:
+                    daemon.stop()
+            finally:
+                mac_srv.shutdown()
+                mac_srv.server_close()
+
+    def test_concurrent_wake_probe_not_lost_by_run_loop(self) -> None:
+        class _SlowClearEvent(threading.Event):
+            def __init__(self) -> None:
+                super().__init__()
+                self.clear_entered = threading.Event()
+                self.delay_clear = True
+
+            def clear(self) -> None:
+                self.clear_entered.set()
+                if self.delay_clear:
+                    time.sleep(0.05)
+                super().clear()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dest_root = Path(tmp) / "MacDest"
+            mac_cfg = Path(tmp) / "mac.json"
+            save_mac_config(
+                MacConfig(
+                    dest_root=str(dest_root),
+                    listen_host="127.0.0.1",
+                    listen_port=0,
+                    notify_on_batch=False,
+                    tailscale_only=True,
+                ),
+                mac_cfg,
+            )
+            mac_srv = MacReceiverServer(mac_cfg)
+            mac_srv.start()
+            try:
+                cfg_holder = [DaemonConfig(target_host="", target_port=mac_srv.server_port, watched_folders=[])]
+                store = SyncStore(Path(tmp) / "state.db")
+                wake_event = _SlowClearEvent()
+                from cp0_syncd.uploader import Uploader
+
+                uploader = Uploader(store=store, get_config=lambda: cfg_holder[0], wake_event=wake_event)
+                uploader.start()
+                try:
+                    self.assertTrue(wake_event.clear_entered.wait(timeout=2.0))
+                    # Configure target and fire wake(probe=True) while _run_loop is inside clear().
+                    cfg_holder[0] = DaemonConfig(
+                        target_host="127.0.0.1",
+                        target_port=mac_srv.server_port,
+                        watched_folders=[],
+                    )
+                    wake_event.delay_clear = False
+                    uploader.wake(reset_backoff=True, probe=True)
+                    self.assertTrue(
+                        _wait_until(
+                            lambda: store.get_meta("mac_online") == "true"
+                            and store.get_meta("mac_dest_root") == str(dest_root),
+                            timeout=1.5,
+                        )
+                    )
+                finally:
+                    uploader.stop()
+                    store.close()
+            finally:
+                mac_srv.shutdown()
+                mac_srv.server_close()
+
+    def test_ignored_subdirectories_skipped_by_watchers_and_on_file_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cam_dir = root / "Camera"
+            (cam_dir / ".hidden").mkdir(parents=True)
+            (cam_dir / "~tmp").mkdir()
+            (cam_dir / "2026").mkdir()
+            wf = WatchedFolder(id="cam", path=str(cam_dir), label="Camera")
+
+            # 1. PollingWatcher ignores files inside .hidden/ and ~tmp/
+            polled_files: list[Path] = []
+            poller = PollingWatcher(
+                on_file_ready=lambda _wf, p: polled_files.append(p),
+            )
+            poller.sync_folders([wf])
+            (cam_dir / ".hidden" / "a.jpg").write_bytes(b"hidden")
+            (cam_dir / "~tmp" / "b.jpg").write_bytes(b"tilde")
+            (cam_dir / "2026" / "ok.jpg").write_bytes(b"real")
+            poller.poll_once()
+            self.assertEqual(polled_files, [cam_dir / "2026" / "ok.jpg"])
+
+            # 2. InotifyWatcher ignores .hidden/ and ~tmp/ on initial attach and dynamic IN_CREATE | IN_ISDIR
+            fake_libc = _FakeLibc()
+            inotify_dirs: list[Path] = []
+            watcher = InotifyWatcher(
+                on_file_ready=lambda _wf, _p: None,
+                on_dir_created=lambda _wf, p: inotify_dirs.append(p),
+                libc=fake_libc,
+            )
+            watcher.sync_folders([wf])
+            watched_paths = {p for p, _ in fake_libc.watches.values()}
+            self.assertIn(str(cam_dir), watched_paths)
+            self.assertIn(str(cam_dir / "2026"), watched_paths)
+            self.assertNotIn(str(cam_dir / ".hidden"), watched_paths)
+            self.assertNotIn(str(cam_dir / "~tmp"), watched_paths)
+
+            cam_wd = next(wd for wd, (p, _) in fake_libc.watches.items() if p == str(cam_dir))
+            (cam_dir / "~newtmp").mkdir()
+            (cam_dir / ".newdot").mkdir()
+            watcher.process_inotify_bytes(
+                _pack_inotify_event(cam_wd, IN_CREATE | IN_ISDIR, 0, b"~newtmp")
+                + _pack_inotify_event(cam_wd, IN_CREATE | IN_ISDIR, 0, b".newdot")
+            )
+            watched_after = {p for p, _ in fake_libc.watches.values()}
+            self.assertNotIn(str(cam_dir / "~newtmp"), watched_after)
+            self.assertNotIn(str(cam_dir / ".newdot"), watched_after)
+            self.assertEqual(inotify_dirs, [])
+
+            # 3. SyncDaemon._on_file_ready skips files whose relative parent parts start with ignore_prefixes
+            cfg_path = root / "daemon.json"
+            db_path = root / "state.db"
+            sock_path = root / "cp0.sock"
+            save_daemon_config(
+                DaemonConfig(
+                    watched_folders=[wf],
+                    ignore_prefixes=[".", "~", "SKIP_"],
+                ),
+                cfg_path,
+            )
+            daemon = SyncDaemon(cfg_path, db_path, sock_path)
+            try:
+                (cam_dir / "SKIP_dir").mkdir()
+                skip_file = cam_dir / "SKIP_dir" / "ignored.jpg"
+                tilde_file = cam_dir / "~tmp" / "b.jpg"
+                dot_file = cam_dir / ".hidden" / "a.jpg"
+                skip_file.write_bytes(b"skip-me")
+                daemon._on_file_ready(wf, dot_file)
+                daemon._on_file_ready(wf, tilde_file)
+                daemon._on_file_ready(wf, skip_file)
+                self.assertIsNone(daemon.store.next_pending())
+
+                daemon._on_file_ready(wf, cam_dir / "2026" / "ok.jpg")
+                pending = daemon.store.next_pending()
+                assert pending is not None
+                self.assertEqual(pending["rel_path"], "2026/ok.jpg")
+            finally:
+                daemon.store.close()
+
 
 class TestDaemonBinaryEntrypoint(unittest.TestCase):
     def test_cp0_syncd_binary_runs_via_symlink_and_stops_on_sigterm(self) -> None:

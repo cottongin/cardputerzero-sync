@@ -23,7 +23,7 @@ from .config import (
 from .ipc import IpcServer, default_sock_path
 from .store import SyncStore, compute_sha256, default_db_path, is_media_file
 from .uploader import Uploader
-from .watcher import InotifyWatcher, scan_folder
+from .watcher import InotifyWatcher, is_ignored_name, scan_folder
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,10 @@ def _safe_int(value: str | None, default: int = 0) -> int:
         return int(value)
     except ValueError:
         return default
+
+
+def _has_ignored_dir_part(parts: tuple[str, ...], ignore_prefixes: list[str]) -> bool:
+    return any(is_ignored_name(part, ignore_prefixes) for part in parts)
 
 
 class SyncDaemon:
@@ -55,6 +59,7 @@ class SyncDaemon:
         self._config_lock = threading.RLock()
         self.config: DaemonConfig = load_daemon_config(self.config_path)
         self.store = SyncStore(self.db_path)
+        self._recover_interrupted_uploads()
         self.wake_event = threading.Event()
 
         self.uploader = Uploader(
@@ -67,9 +72,17 @@ class SyncDaemon:
             on_file_ready=self._on_file_ready,
             on_dir_created=self._on_dir_created,
             poll_interval=watcher_poll_interval,
+            ignore_prefixes=self.config.ignore_prefixes,
+            get_ignore_prefixes=lambda: self.get_config().ignore_prefixes,
         )
         self.ipc_server = IpcServer(self.sock_path, self.handle_ipc)
         self._started = False
+
+    def _recover_interrupted_uploads(self) -> int:
+        recovered = self.store.recover_interrupted_uploads()
+        if recovered > 0:
+            self.store.log("WARN", f"Recovered {recovered} interrupted upload(s) to PENDING")
+        return recovered
 
     def get_config(self) -> DaemonConfig:
         """Return the current DaemonConfig safely across threads."""
@@ -91,17 +104,25 @@ class SyncDaemon:
         active = next((wf for wf in cfg.watched_folders if wf.id == folder.id and wf.enabled), None)
         if active is None:
             return
+
+        root = Path(os.path.expanduser(active.path))
+        try:
+            rel_obj = file_path.relative_to(root)
+        except ValueError:
+            return
+
+        if _has_ignored_dir_part(rel_obj.parts[:-1], cfg.ignore_prefixes):
+            return
         if not is_media_file(file_path, cfg, store=self.store):
             return
 
-        root = Path(os.path.expanduser(active.path))
         try:
             st = file_path.stat()
             if st.st_size <= 0:
                 return
             sha256 = compute_sha256(file_path)
-            rel_path = file_path.relative_to(root).as_posix()
-        except (OSError, ValueError):
+            rel_path = rel_obj.as_posix()
+        except OSError:
             return
 
         outcome = self.store.enqueue_file(
@@ -115,10 +136,17 @@ class SyncDaemon:
         if outcome == "enqueued":
             self.uploader.notify_new_file()
 
-    def _on_dir_created(self, folder: WatchedFolder, _dir_path: Path) -> None:
+    def _on_dir_created(self, folder: WatchedFolder, dir_path: Path) -> None:
         cfg = self.get_config()
         active = next((wf for wf in cfg.watched_folders if wf.id == folder.id and wf.enabled), None)
         if active is None:
+            return
+        root = Path(os.path.expanduser(active.path))
+        try:
+            rel_parts = dir_path.relative_to(root).parts
+        except ValueError:
+            return
+        if rel_parts and _has_ignored_dir_part(rel_parts, cfg.ignore_prefixes):
             return
         added = scan_folder(active, cfg, self.store)
         if added > 0:
@@ -130,6 +158,7 @@ class SyncDaemon:
             return
         self._started = True
         self.store.log("INFO", "cp0-syncd started")
+        self._recover_interrupted_uploads()
         self.watcher.sync_folders(self.get_config().watched_folders)
         self.watcher.start()
         self.scan_all()

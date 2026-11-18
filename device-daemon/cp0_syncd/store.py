@@ -211,6 +211,19 @@ class SyncStore:
             )
             self._conn.commit()
 
+    def recover_interrupted_uploads(self) -> int:
+        """Reset stale UPLOADING rows back to PENDING after an unclean restart."""
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                UPDATE files
+                SET status = 'PENDING'
+                WHERE status = 'UPLOADING'
+                """
+            )
+            self._conn.commit()
+            return cur.rowcount
+
     def mark_synced(self, file_id: int) -> None:
         """Mark a file as SYNCED and clear any prior error."""
         now_ms = _now_ms()

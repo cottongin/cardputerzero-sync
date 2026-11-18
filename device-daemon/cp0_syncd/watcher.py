@@ -13,9 +13,9 @@ import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
-from .config import DaemonConfig, WatchedFolder
+from .config import DEFAULT_IGNORE_PREFIXES, DaemonConfig, WatchedFolder
 from .store import SyncStore, compute_sha256, is_media_file
 
 logger = logging.getLogger(__name__)
@@ -67,6 +67,11 @@ def parse_inotify_events(data: bytes) -> list[InotifyEvent]:
     return events
 
 
+def is_ignored_name(name: str, ignore_prefixes: Sequence[str]) -> bool:
+    """Return True if a file or directory basename matches any configured ignore prefix."""
+    return bool(name) and any(name.startswith(prefix) for prefix in ignore_prefixes if prefix)
+
+
 def scan_folder(folder: WatchedFolder, cfg: DaemonConfig, store: SyncStore) -> int:
     """Recursively scan an enabled watched folder and enqueue new media files."""
     if not folder.enabled:
@@ -77,13 +82,10 @@ def scan_folder(folder: WatchedFolder, cfg: DaemonConfig, store: SyncStore) -> i
         return 0
 
     enqueued = 0
-    ignore_prefixes = [prefix for prefix in cfg.ignore_prefixes if prefix]
 
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         dirnames[:] = sorted(
-            name
-            for name in dirnames
-            if not any(name.startswith(prefix) for prefix in ignore_prefixes)
+            name for name in dirnames if not is_ignored_name(name, cfg.ignore_prefixes)
         )
         current_dir = Path(dirpath)
         for filename in sorted(filenames):
@@ -159,13 +161,16 @@ def _nearest_existing_ancestor(target: Path) -> Path:
         candidate = parent
 
 
-def _iter_subdirs(root: Path) -> list[Path]:
-    """Yield root and all non-symlink subdirectories beneath root."""
+def _iter_subdirs(
+    root: Path,
+    ignore_prefixes: Sequence[str] = DEFAULT_IGNORE_PREFIXES,
+) -> list[Path]:
+    """Yield root and all non-symlink, non-ignored subdirectories beneath root."""
     dirs: list[Path] = []
     if not root.is_dir():
         return dirs
     for dirpath, dirnames, _ in os.walk(root, followlinks=False):
-        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        dirnames[:] = sorted(d for d in dirnames if not is_ignored_name(d, ignore_prefixes))
         dirs.append(Path(dirpath))
     return dirs
 
@@ -178,15 +183,24 @@ class PollingWatcher:
         on_file_ready: Callable[[WatchedFolder, Path], None],
         on_dir_created: Callable[[WatchedFolder, Path], None] | None = None,
         poll_interval: float = 0.5,
+        ignore_prefixes: Sequence[str] = DEFAULT_IGNORE_PREFIXES,
+        get_ignore_prefixes: Callable[[], Sequence[str]] | None = None,
     ) -> None:
         self._on_file_ready = on_file_ready
         self._on_dir_created = on_dir_created
         self._poll_interval = max(0.02, float(poll_interval))
+        self._ignore_prefixes = tuple(ignore_prefixes)
+        self._get_ignore_prefixes = get_ignore_prefixes
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._folders: dict[str, WatchedFolder] = {}
         self._snapshots: dict[str, dict[str, Any]] = {}
+
+    def _current_ignore_prefixes(self) -> Sequence[str]:
+        if self._get_ignore_prefixes is not None:
+            return self._get_ignore_prefixes()
+        return self._ignore_prefixes
 
     def sync_folders(self, folders: list[WatchedFolder]) -> None:
         with self._lock:
@@ -219,15 +233,18 @@ class PollingWatcher:
         root = Path(os.path.expanduser(folder.path))
         if not root.is_dir():
             return {"present": False, "dirs": set(), "files": {}}
-        dirs, files = self._scan_tree(root)
+        dirs, files = self._scan_tree(root, self._current_ignore_prefixes())
         return {"present": True, "dirs": dirs, "files": files}
 
     @staticmethod
-    def _scan_tree(root: Path) -> tuple[set[Path], dict[Path, tuple[int, int]]]:
+    def _scan_tree(
+        root: Path,
+        ignore_prefixes: Sequence[str] = DEFAULT_IGNORE_PREFIXES,
+    ) -> tuple[set[Path], dict[Path, tuple[int, int]]]:
         dirs: set[Path] = set()
         files: dict[Path, tuple[int, int]] = {}
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-            dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+            dirnames[:] = sorted(d for d in dirnames if not is_ignored_name(d, ignore_prefixes))
             cur = Path(dirpath)
             dirs.add(cur)
             for name in filenames:
@@ -242,6 +259,7 @@ class PollingWatcher:
     def poll_once(self) -> None:
         events_dirs: list[tuple[WatchedFolder, Path]] = []
         events_files: list[tuple[WatchedFolder, Path]] = []
+        ignore_prefixes = self._current_ignore_prefixes()
 
         with self._lock:
             items = list(self._folders.items())
@@ -260,7 +278,7 @@ class PollingWatcher:
                     snap["files"] = {}
                     continue
 
-                dirs, files = self._scan_tree(root)
+                dirs, files = self._scan_tree(root, ignore_prefixes)
                 prev_dirs: set[Path] = snap["dirs"]
                 prev_files: dict[Path, tuple[int, int]] = snap["files"]
 
@@ -315,10 +333,14 @@ class InotifyWatcher:
         on_dir_created: Callable[[WatchedFolder, Path], None] | None = None,
         poll_interval: float = 0.5,
         libc: Any | None = None,
+        ignore_prefixes: Sequence[str] = DEFAULT_IGNORE_PREFIXES,
+        get_ignore_prefixes: Callable[[], Sequence[str]] | None = None,
     ) -> None:
         self._on_file_ready = on_file_ready
         self._on_dir_created = on_dir_created
         self._poll_interval = max(0.05, float(poll_interval))
+        self._ignore_prefixes = tuple(ignore_prefixes)
+        self._get_ignore_prefixes = get_ignore_prefixes
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -353,7 +375,14 @@ class InotifyWatcher:
                 on_file_ready=on_file_ready,
                 on_dir_created=on_dir_created,
                 poll_interval=self._poll_interval,
+                ignore_prefixes=self._ignore_prefixes,
+                get_ignore_prefixes=self._get_ignore_prefixes,
             )
+
+    def _current_ignore_prefixes(self) -> Sequence[str]:
+        if self._get_ignore_prefixes is not None:
+            return self._get_ignore_prefixes()
+        return self._ignore_prefixes
 
     @property
     def is_using_polling(self) -> bool:
@@ -438,7 +467,7 @@ class InotifyWatcher:
 
     def _attach_tree_locked(self, folder: WatchedFolder, root: Path) -> None:
         wds = self._folder_wds.setdefault(folder.id, set())
-        for subdir in _iter_subdirs(root):
+        for subdir in _iter_subdirs(root, self._current_ignore_prefixes()):
             wd = self._add_watch_locked(subdir, _DIR_WATCH_MASK)
             if wd is not None:
                 self._active_by_wd[wd] = (folder, subdir)
@@ -584,9 +613,10 @@ class InotifyWatcher:
         active = self._active_by_wd.get(wd)
         if active is not None:
             folder, _ = active
-            if created_dir.is_dir():
-                self._attach_tree_locked(folder, created_dir)
-            dir_callbacks.append((folder, created_dir))
+            if not is_ignored_name(created_dir.name, self._current_ignore_prefixes()):
+                if created_dir.is_dir():
+                    self._attach_tree_locked(folder, created_dir)
+                dir_callbacks.append((folder, created_dir))
 
         anc = self._ancestors_by_wd.get(wd)
         if anc is not None:
