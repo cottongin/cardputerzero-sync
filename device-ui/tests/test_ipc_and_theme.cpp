@@ -370,6 +370,29 @@ void test_sqlite_fallback_and_config() {
     cp0::IpcClient missing_all((tmp.path / "nonexistent.sock").string(), (tmp.path / "no.db").string(), (tmp.path / "no-cfg.json").string());
     assert(missing_all.read_sqlite_fallback().ok == false);
     assert(missing_all.fetch_status().ok == false);
+
+    // Corrupt / non-SQLite DB file returns ok=false with SQLite error
+    fs::path corrupt_db = tmp.path / "corrupt.db";
+    {
+        std::ofstream bad_out(corrupt_db, std::ios::binary);
+        bad_out << "this is definitely not a sqlite database header";
+    }
+    cp0::IpcClient corrupt_client((tmp.path / "nonexistent.sock").string(), corrupt_db.string(), cfg_path.string());
+    auto corrupt_st = corrupt_client.read_sqlite_fallback();
+    assert(corrupt_st.ok == false);
+    assert(!corrupt_st.error.empty());
+    assert(!corrupt_st.last_error.empty());
+
+    // Empty / schema-less 0-byte DB file returns ok=false
+    fs::path empty_db = tmp.path / "empty.db";
+    {
+        std::ofstream empty_out(empty_db, std::ios::binary);
+    }
+    cp0::IpcClient empty_client((tmp.path / "nonexistent.sock").string(), empty_db.string(), cfg_path.string());
+    auto empty_st = empty_client.read_sqlite_fallback();
+    assert(empty_st.ok == false);
+    assert(!empty_st.error.empty());
+    assert(!empty_st.last_error.empty());
 }
 
 void test_status_parsing_and_env_paths() {
@@ -432,14 +455,18 @@ void test_list_tailscale_peers_subprocess() {
     }
     fs::permissions(fake_bin, fs::perms::owner_exec | fs::perms::owner_read | fs::perms::owner_write);
 
-    const char* old_path = std::getenv("PATH");
-    std::string new_path = tmp.path.string() + (old_path ? (std::string(":") + old_path) : "");
+    const char* old_path_env = std::getenv("PATH");
+    const bool had_path = (old_path_env != nullptr);
+    const std::string saved_path = had_path ? old_path_env : "";
+    std::string new_path = tmp.path.string() + (had_path ? (std::string(":") + saved_path) : "");
     setenv("PATH", new_path.c_str(), 1);
 
     cp0::IpcClient client;
     auto peers = client.list_tailscale_peers();
-    if (old_path) {
-        setenv("PATH", old_path, 1);
+    if (had_path) {
+        setenv("PATH", saved_path.c_str(), 1);
+    } else {
+        unsetenv("PATH");
     }
 
     assert(peers.size() == 1);

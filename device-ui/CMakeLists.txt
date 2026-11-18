@@ -10,6 +10,7 @@ option(CP0_UI_BUILD_APP "Build cp0-sync-ui LVGL executable" ON)
 option(CP0_UI_TARGET_DEVICE "Target CardputerZero Linux fbdev/evdev instead of SDL2 simulator" OFF)
 
 find_package(SQLite3 REQUIRED)
+find_package(Threads REQUIRED)
 
 add_library(cp0_ui_core STATIC
     src/theme.cpp
@@ -34,7 +35,10 @@ if(CP0_UI_BUILD_TESTS)
     add_executable(test_ipc_and_theme
         tests/test_ipc_and_theme.cpp
     )
-    target_link_libraries(test_ipc_and_theme PRIVATE cp0_ui_core)
+    target_link_libraries(test_ipc_and_theme PRIVATE
+        cp0_ui_core
+        Threads::Threads
+    )
     target_compile_options(test_ipc_and_theme PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME test_ipc_and_theme COMMAND test_ipc_and_theme)
 endif()

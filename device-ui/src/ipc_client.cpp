@@ -14,6 +14,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -970,31 +971,47 @@ DaemonStatus IpcClient::read_sqlite_fallback() const {
     std::string db_path = resolved_db_path();
     SqliteDbGuard db_guard;
     if (sqlite3_open_v2(db_path.c_str(), &db_guard.db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+        std::string err = db_guard.db != nullptr ? sqlite3_errmsg(db_guard.db) : "Failed to open SQLite DB";
         status.ok = false;
-        status.error = db_guard.db != nullptr ? sqlite3_errmsg(db_guard.db) : "Failed to open SQLite DB";
+        status.error = err;
+        status.last_error = err;
         return status;
     }
     sqlite3_busy_timeout(db_guard.db, 1000);
 
+    auto fail_sqlite = [&](const char* fallback_msg) -> DaemonStatus {
+        const char* raw_err = db_guard.db != nullptr ? sqlite3_errmsg(db_guard.db) : nullptr;
+        std::string err = (raw_err != nullptr && raw_err[0] != '\0') ? raw_err : fallback_msg;
+        status.ok = false;
+        status.error = err;
+        status.last_error = err;
+        return status;
+    };
+
     // 1. Read meta table
     {
         SqliteStmtGuard stmt;
-        if (sqlite3_prepare_v2(db_guard.db, "SELECT key, value FROM meta", -1, &stmt.stmt, nullptr) == SQLITE_OK) {
-            while (sqlite3_step(stmt.stmt) == SQLITE_ROW) {
-                std::string k = col_text(stmt.stmt, 0);
-                std::string v = col_text(stmt.stmt, 1);
-                if (k == "mac_online") {
-                    status.mac_online = (v == "true");
-                } else if (k == "mac_dest_root") {
-                    status.mac_dest_root = v;
-                } else if (k == "last_sync_ts") {
-                    status.last_sync_ts = parse_int64_safe(v, 0);
-                } else if (k == "last_synced_file") {
-                    status.last_synced_file = v;
-                } else if (k == "last_error") {
-                    status.last_error = v;
-                }
+        if (sqlite3_prepare_v2(db_guard.db, "SELECT key, value FROM meta", -1, &stmt.stmt, nullptr) != SQLITE_OK) {
+            return fail_sqlite("Failed to prepare SQLite meta query");
+        }
+        int rc = SQLITE_OK;
+        while ((rc = sqlite3_step(stmt.stmt)) == SQLITE_ROW) {
+            std::string k = col_text(stmt.stmt, 0);
+            std::string v = col_text(stmt.stmt, 1);
+            if (k == "mac_online") {
+                status.mac_online = (v == "true");
+            } else if (k == "mac_dest_root") {
+                status.mac_dest_root = v;
+            } else if (k == "last_sync_ts") {
+                status.last_sync_ts = parse_int64_safe(v, 0);
+            } else if (k == "last_synced_file") {
+                status.last_synced_file = v;
+            } else if (k == "last_error") {
+                status.last_error = v;
             }
+        }
+        if (rc != SQLITE_DONE) {
+            return fail_sqlite("Failed while reading SQLite meta table");
         }
     }
 
@@ -1014,36 +1031,41 @@ DaemonStatus IpcClient::read_sqlite_fallback() const {
         const char* sql =
             "SELECT folder_id, status, COUNT(*), COALESCE(SUM(size_bytes), 0) "
             "FROM files GROUP BY folder_id, status";
-        if (sqlite3_prepare_v2(db_guard.db, sql, -1, &stmt.stmt, nullptr) == SQLITE_OK) {
-            while (sqlite3_step(stmt.stmt) == SQLITE_ROW) {
-                std::string fid = col_text(stmt.stmt, 0);
-                std::string st = col_text(stmt.stmt, 1);
-                int cnt = sqlite3_column_int(stmt.stmt, 2);
-                int64_t bytes = sqlite3_column_int64(stmt.stmt, 3);
+        if (sqlite3_prepare_v2(db_guard.db, sql, -1, &stmt.stmt, nullptr) != SQLITE_OK) {
+            return fail_sqlite("Failed to prepare SQLite files query");
+        }
+        int rc = SQLITE_OK;
+        while ((rc = sqlite3_step(stmt.stmt)) == SQLITE_ROW) {
+            std::string fid = col_text(stmt.stmt, 0);
+            std::string st = col_text(stmt.stmt, 1);
+            int cnt = sqlite3_column_int(stmt.stmt, 2);
+            int64_t bytes = sqlite3_column_int64(stmt.stmt, 3);
 
-                if (by_folder.find(fid) == by_folder.end()) {
-                    seen_folder_order.push_back(fid);
-                }
-                auto& bucket = by_folder[fid];
-                if (st == "PENDING") {
-                    bucket.pending += cnt;
-                    bucket.pending_bytes += bytes;
-                    status.pending_count += cnt;
-                    status.pending_bytes += bytes;
-                } else if (st == "UPLOADING") {
-                    bucket.pending += cnt;
-                    bucket.uploading += cnt;
-                    bucket.pending_bytes += bytes;
-                    status.pending_count += cnt;
-                    status.pending_bytes += bytes;
-                } else if (st == "SYNCED") {
-                    bucket.synced += cnt;
-                    status.synced_count += cnt;
-                } else if (st == "FAILED") {
-                    bucket.failed += cnt;
-                    status.failed_count += cnt;
-                }
+            if (by_folder.find(fid) == by_folder.end()) {
+                seen_folder_order.push_back(fid);
             }
+            auto& bucket = by_folder[fid];
+            if (st == "PENDING") {
+                bucket.pending += cnt;
+                bucket.pending_bytes += bytes;
+                status.pending_count += cnt;
+                status.pending_bytes += bytes;
+            } else if (st == "UPLOADING") {
+                bucket.pending += cnt;
+                bucket.uploading += cnt;
+                bucket.pending_bytes += bytes;
+                status.pending_count += cnt;
+                status.pending_bytes += bytes;
+            } else if (st == "SYNCED") {
+                bucket.synced += cnt;
+                status.synced_count += cnt;
+            } else if (st == "FAILED") {
+                bucket.failed += cnt;
+                status.failed_count += cnt;
+            }
+        }
+        if (rc != SQLITE_DONE) {
+            return fail_sqlite("Failed while reading SQLite files table");
         }
     }
 
@@ -1081,15 +1103,20 @@ DaemonStatus IpcClient::read_sqlite_fallback() const {
     {
         SqliteStmtGuard stmt;
         const char* sql = "SELECT id, ts, level, message FROM logs ORDER BY id DESC LIMIT 50";
-        if (sqlite3_prepare_v2(db_guard.db, sql, -1, &stmt.stmt, nullptr) == SQLITE_OK) {
-            while (sqlite3_step(stmt.stmt) == SQLITE_ROW) {
-                LogEntry entry;
-                entry.id = sqlite3_column_int64(stmt.stmt, 0);
-                entry.ts = sqlite3_column_int64(stmt.stmt, 1);
-                entry.level = col_text(stmt.stmt, 2);
-                entry.message = col_text(stmt.stmt, 3);
-                status.logs.push_back(std::move(entry));
-            }
+        if (sqlite3_prepare_v2(db_guard.db, sql, -1, &stmt.stmt, nullptr) != SQLITE_OK) {
+            return fail_sqlite("Failed to prepare SQLite logs query");
+        }
+        int rc = SQLITE_OK;
+        while ((rc = sqlite3_step(stmt.stmt)) == SQLITE_ROW) {
+            LogEntry entry;
+            entry.id = sqlite3_column_int64(stmt.stmt, 0);
+            entry.ts = sqlite3_column_int64(stmt.stmt, 1);
+            entry.level = col_text(stmt.stmt, 2);
+            entry.message = col_text(stmt.stmt, 3);
+            status.logs.push_back(std::move(entry));
+        }
+        if (rc != SQLITE_DONE) {
+            return fail_sqlite("Failed while reading SQLite logs table");
         }
     }
 
