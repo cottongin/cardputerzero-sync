@@ -925,6 +925,7 @@ DaemonStatus IpcClient::read_sqlite_fallback() const {
     status.from_fallback = true;
 
     // Populate config fields even if daemon is offline
+    bool config_loaded = false;
     std::vector<FolderStatus> configured_folders;
     {
         std::ifstream cfg_in(resolved_config_path());
@@ -933,6 +934,7 @@ DaemonStatus IpcClient::read_sqlite_fallback() const {
             ss << cfg_in.rdbuf();
             JsonValue cfg_root;
             if (parse_json(ss.str(), cfg_root) && cfg_root.type == JsonValue::Type::Object) {
+                config_loaded = true;
                 if (const auto* v = cfg_root.find("target_host")) {
                     status.target_host = v->as_string();
                 }
@@ -1083,20 +1085,22 @@ DaemonStatus IpcClient::read_sqlite_fallback() const {
         status.folders.push_back(std::move(wf));
     }
 
-    for (const auto& fid : seen_folder_order) {
-        if (included[fid]) {
-            continue;
+    if (!config_loaded) {
+        for (const auto& fid : seen_folder_order) {
+            if (included[fid]) {
+                continue;
+            }
+            const auto& c = by_folder[fid];
+            FolderStatus fs;
+            fs.id = fid;
+            fs.label = fid;
+            fs.pending = c.pending;
+            fs.uploading = c.uploading;
+            fs.synced = c.synced;
+            fs.failed = c.failed;
+            fs.pending_bytes = c.pending_bytes;
+            status.folders.push_back(std::move(fs));
         }
-        const auto& c = by_folder[fid];
-        FolderStatus fs;
-        fs.id = fid;
-        fs.label = fid;
-        fs.pending = c.pending;
-        fs.uploading = c.uploading;
-        fs.synced = c.synced;
-        fs.failed = c.failed;
-        fs.pending_bytes = c.pending_bytes;
-        status.folders.push_back(std::move(fs));
     }
 
     // 3. Read newest 50 log entries

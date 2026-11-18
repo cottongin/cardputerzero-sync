@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import socket
 import tempfile
 import threading
 import time
@@ -16,6 +17,7 @@ from urllib.request import Request, urlopen
 from cp0_mac_receiver.config import MacConfig, load_mac_config, save_mac_config
 from cp0_mac_receiver.server import (
     MacReceiverServer,
+    _MacReceiverHandler,
     _default_osascript_notifier,
     is_allowed_client_ip,
 )
@@ -248,9 +250,142 @@ class TestMacReceiverServer(unittest.TestCase):
         ctx2.exception.close()
 
         camera_dir = self.dest_root / "Camera"
-        if camera_dir.exists():
-            self.assertEqual(list(camera_dir.rglob("*.part")), [])
-            self.assertFalse((camera_dir / "a.jpg").exists())
+        self.assertTrue(camera_dir.is_dir())
+        self.assertEqual(list(camera_dir.rglob("*.part")), [])
+        self.assertFalse((camera_dir / "a.jpg").exists())
+
+    def _read_http_response(self, sock: socket.socket) -> tuple[int, dict]:
+        chunks = []
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+        head, _, body = raw.partition(b"\r\n\r\n")
+        status_line = head.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
+        status_code = int(status_line.split()[1])
+        return status_code, json.loads(body.decode("utf-8"))
+
+    def test_rejects_out_of_range_mtime_with_400(self):
+        payload = b"mtime-test-bytes"
+        sha = hashlib.sha256(payload).hexdigest()
+        for bad_mtime in ("1e20", "1e12", "-1", "-1e20", "nan", "inf", "not-a-number"):
+            req = Request(
+                f"{self.base_url}/upload",
+                data=payload,
+                method="POST",
+                headers={
+                    "Content-Length": str(len(payload)),
+                    "X-CP0-Folder-Label": "Camera",
+                    "X-CP0-Rel-Path": "bad_mtime.jpg",
+                    "X-CP0-SHA256": sha,
+                    "X-CP0-Mtime": bad_mtime,
+                },
+            )
+            with self.assertRaises(HTTPError) as ctx:
+                urlopen(req)
+            self.assertEqual(ctx.exception.code, 400, f"mtime={bad_mtime}")
+            body = json.loads(ctx.exception.read())
+            self.assertEqual(body["error"], "invalid X-CP0-Mtime")
+            ctx.exception.close()
+
+        self.assertEqual(list(self.dest_root.rglob("*.part")), [])
+
+    def test_filesystem_collision_returns_400_without_leaking_part_files(self):
+        self.dest_root.mkdir(parents=True, exist_ok=True)
+        blocking_file = self.dest_root / "BlockedFile"
+        blocking_file.write_bytes(b"original-file")
+
+        for rel_path in ("a.jpg", "sub/a.jpg"):
+            with self.assertRaises(HTTPError) as ctx:
+                self._upload("BlockedFile", rel_path, b"photo-bytes")
+            self.assertEqual(ctx.exception.code, 400)
+            body = json.loads(ctx.exception.read())
+            self.assertIn("error", body)
+            ctx.exception.close()
+
+        self.assertEqual(blocking_file.read_bytes(), b"original-file")
+
+        blocking_dir = self.dest_root / "Camera" / "existing_dir.jpg"
+        blocking_dir.mkdir(parents=True, exist_ok=True)
+        with self.assertRaises(HTTPError) as ctx2:
+            self._upload("Camera", "existing_dir.jpg", b"photo-bytes")
+        self.assertEqual(ctx2.exception.code, 400)
+        body2 = json.loads(ctx2.exception.read())
+        self.assertIn("error", body2)
+        ctx2.exception.close()
+
+        self.assertTrue(blocking_dir.is_dir())
+        self.assertEqual(list(self.dest_root.rglob("*.part")), [])
+
+    def test_premature_client_disconnect_cleans_part_file(self):
+        port = self.srv.server_address[1]
+        payload = b"partial"
+        sha = hashlib.sha256(b"x" * 1024).hexdigest()
+        raw_req = (
+            "POST /upload HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{port}\r\n"
+            "Content-Length: 1024\r\n"
+            "X-CP0-Folder-Label: Camera\r\n"
+            "X-CP0-Rel-Path: partial.jpg\r\n"
+            f"X-CP0-SHA256: {sha}\r\n"
+            "X-CP0-Mtime: 1700000000\r\n"
+            "\r\n"
+        ).encode("ascii") + payload
+
+        with socket.create_connection(("127.0.0.1", port), timeout=5.0) as sock:
+            sock.sendall(raw_req)
+            sock.shutdown(socket.SHUT_WR)
+            status_code, body = self._read_http_response(sock)
+
+        self.assertEqual(status_code, 400)
+        self.assertEqual(body["error"], "incomplete request body")
+        camera_dir = self.dest_root / "Camera"
+        self.assertTrue(camera_dir.is_dir())
+        self.assertEqual(list(camera_dir.rglob("*.part")), [])
+        self.assertFalse((camera_dir / "partial.jpg").exists())
+
+    def test_upload_timeout_returns_408_and_cleans_part_file(self):
+        port = self.srv.server_address[1]
+        sha = hashlib.sha256(b"x" * 1024).hexdigest()
+        raw_req = (
+            "POST /upload HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{port}\r\n"
+            "Content-Length: 1024\r\n"
+            "X-CP0-Folder-Label: Camera\r\n"
+            "X-CP0-Rel-Path: slow.jpg\r\n"
+            f"X-CP0-SHA256: {sha}\r\n"
+            "X-CP0-Mtime: 1700000000\r\n"
+            "\r\n"
+            "partial"
+        ).encode("ascii")
+
+        with patch.object(_MacReceiverHandler, "timeout", 0.15):
+            with socket.create_connection(("127.0.0.1", port), timeout=5.0) as sock:
+                sock.sendall(raw_req)
+                status_code, body = self._read_http_response(sock)
+
+        self.assertEqual(status_code, 408)
+        self.assertEqual(body, {"ok": False, "error": "Upload timed out"})
+        camera_dir = self.dest_root / "Camera"
+        self.assertTrue(camera_dir.is_dir())
+        self.assertEqual(list(camera_dir.rglob("*.part")), [])
+        self.assertFalse((camera_dir / "slow.jpg").exists())
+
+    def test_utime_oserror_does_not_fail_commit(self):
+        with (
+            patch("cp0_mac_receiver.server.os.utime", side_effect=OSError("utime denied")),
+            self.assertLogs("cp0_mac_receiver.server", level="WARNING"),
+        ):
+            with self._upload("Camera", "utime_warn.jpg", b"utime-fallback", 1700000000.0) as resp:
+                self.assertEqual(resp.status, 200)
+                body = json.loads(resp.read())
+
+        self.assertEqual(body["status"], "saved")
+        target = self.dest_root / "Camera" / "utime_warn.jpg"
+        self.assertEqual(target.read_bytes(), b"utime-fallback")
+        self.assertEqual(list(self.dest_root.rglob("*.part")), [])
 
     def test_debounced_batch_notification_fires_once_after_burst(self):
         with self._upload("Camera", "img1.jpg", b"photo-1", 1700000001.0) as r1:
@@ -286,6 +421,28 @@ class TestMacReceiverServer(unittest.TestCase):
             res = json.loads(resp.read())
         self.assertEqual(res["status"], "saved")
         self.assertTrue((new_dest / "DCIM" / "p1.jpg").is_file())
+
+    def test_health_and_server_expand_tilde_in_dest_root(self):
+        save_mac_config(
+            MacConfig(
+                dest_root="~/Pictures/CardputerZero",
+                listen_host="127.0.0.1",
+                listen_port=0,
+                notify_on_batch=True,
+                tailscale_only=True,
+            ),
+            self.cfg_path,
+        )
+        expected = str(Path("~/Pictures/CardputerZero").expanduser())
+        with urlopen(f"{self.base_url}/health") as resp:
+            body = json.loads(resp.read())
+            self.assertEqual(body["dest_root"], expected)
+
+        srv2 = MacReceiverServer(self.cfg_path, notifier=lambda _c, _d: None, debounce_sec=0.05)
+        try:
+            self.assertEqual(srv2._pending_dest, Path(expected))
+        finally:
+            srv2.server_close()
 
 
 if __name__ == "__main__":

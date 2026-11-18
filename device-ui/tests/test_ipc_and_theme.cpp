@@ -476,6 +476,99 @@ void test_list_tailscale_peers_subprocess() {
     assert(peers[0].online == true);
 }
 
+void test_sqlite_fallback_omits_removed_folders() {
+    TempDir tmp("cp0_sqlite_removed");
+    fs::path db_path = tmp.path / "state.db";
+    fs::path cfg_path = tmp.path / "config.json";
+    fs::path f1_dir = tmp.path / "f1";
+    fs::create_directories(f1_dir);
+
+    sqlite3* db = nullptr;
+    assert(sqlite3_open(db_path.c_str(), &db) == SQLITE_OK);
+    const char* schema_sql = R"SQL(
+        CREATE TABLE files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            folder_id TEXT NOT NULL,
+            abs_path TEXT NOT NULL,
+            rel_path TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            status TEXT NOT NULL,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            discovered_at INTEGER NOT NULL,
+            synced_at INTEGER
+        );
+        CREATE TABLE logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            level TEXT NOT NULL,
+            message TEXT NOT NULL
+        );
+        CREATE TABLE meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        INSERT INTO files(folder_id, abs_path, rel_path, size_bytes, mtime_ns, sha256, status, discovered_at)
+        VALUES
+            ('f1', '/tmp/f1/a.jpg', 'a.jpg', 1000, 1, 'h1', 'SYNCED', 100),
+            ('f2', '/tmp/f2/b.jpg', 'b.jpg', 2000, 2, 'h2', 'SYNCED', 101);
+    )SQL";
+    char* errmsg = nullptr;
+    assert(sqlite3_exec(db, schema_sql, nullptr, nullptr, &errmsg) == SQLITE_OK);
+    sqlite3_close(db);
+
+    // 1. Valid config.json with f1 only: f2 must NOT be resurrected as a ghost folder
+    {
+        std::ofstream cfg_out(cfg_path);
+        cfg_out << R"({
+            "target_host": "mac.ts.net",
+            "target_port": 8765,
+            "theme": "dark",
+            "watched_folders": [
+                {"id": "f1", "path": ")" << f1_dir.string() << R"(", "label": "F1", "enabled": true}
+            ]
+        })";
+    }
+    cp0::IpcClient client((tmp.path / "nonexistent.sock").string(), db_path.string(), cfg_path.string());
+    auto st = client.read_sqlite_fallback();
+    assert(st.ok == true);
+    assert(st.from_fallback == true);
+    assert(st.synced_count == 2);
+    assert(st.folders.size() == 1);
+    assert(st.folders[0].id == "f1");
+    assert(st.folders[0].synced == 1);
+
+    // 2. Valid config.json with empty watched_folders []: no folders resurrected
+    {
+        std::ofstream cfg_out(cfg_path, std::ios::trunc);
+        cfg_out << R"({"target_host": "mac.ts.net", "target_port": 8765, "watched_folders": []})";
+    }
+    auto empty_cfg_st = client.read_sqlite_fallback();
+    assert(empty_cfg_st.ok == true);
+    assert(empty_cfg_st.folders.empty());
+
+    // 3. Missing config.json: fallback synthesizes both f1 and f2 from files
+    cp0::IpcClient missing_cfg((tmp.path / "nonexistent.sock").string(), db_path.string(), (tmp.path / "missing.json").string());
+    auto missing_st = missing_cfg.read_sqlite_fallback();
+    assert(missing_st.ok == true);
+    assert(missing_st.folders.size() == 2);
+    assert(missing_st.folders[0].id == "f1");
+    assert(missing_st.folders[1].id == "f2");
+
+    // 4. Corrupt config.json: fallback synthesizes both f1 and f2 from files
+    fs::path corrupt_cfg = tmp.path / "corrupt.json";
+    {
+        std::ofstream bad_out(corrupt_cfg);
+        bad_out << "{not valid json";
+    }
+    cp0::IpcClient corrupt_client((tmp.path / "nonexistent.sock").string(), db_path.string(), corrupt_cfg.string());
+    auto corrupt_st = corrupt_client.read_sqlite_fallback();
+    assert(corrupt_st.ok == true);
+    assert(corrupt_st.folders.size() == 2);
+}
+
 } // namespace
 
 int main() {
@@ -483,6 +576,7 @@ int main() {
     test_tailscale_peer_parsing();
     test_ipc_socket_round_trip();
     test_sqlite_fallback_and_config();
+    test_sqlite_fallback_omits_removed_folders();
     test_status_parsing_and_env_paths();
     test_list_tailscale_peers_subprocess();
     std::cout << "All test_ipc_and_theme assertions passed.\n";

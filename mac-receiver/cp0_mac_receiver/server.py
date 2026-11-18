@@ -129,6 +129,7 @@ def _collision_candidate(target_path: Path, mtime: float, sha256_hex: str, index
 
 class _MacReceiverHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    timeout = 60.0
 
     def log_message(self, format: str, *args: object) -> None:
         logger.debug("%s - %s", self.client_address[0], format % args)
@@ -142,8 +143,9 @@ class _MacReceiverHandler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            self.close_connection = True
 
     def _load_and_authorize(self) -> MacConfig | None:
         cfg = load_mac_config(self.server.config_path)  # type: ignore[attr-defined]
@@ -170,7 +172,7 @@ class _MacReceiverHandler(BaseHTTPRequestHandler):
                 "status": "ok",
                 "version": VERSION,
                 "hostname": socket.gethostname(),
-                "dest_root": cfg.dest_root,
+                "dest_root": str(Path(cfg.dest_root).expanduser()),
             },
         )
 
@@ -211,7 +213,12 @@ class _MacReceiverHandler(BaseHTTPRequestHandler):
             except ValueError:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid X-CP0-Mtime"})
                 return
-            if not math.isfinite(mtime):
+            if not math.isfinite(mtime) or mtime < 0:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid X-CP0-Mtime"})
+                return
+            try:
+                datetime.fromtimestamp(mtime, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid X-CP0-Mtime"})
                 return
 
@@ -223,19 +230,38 @@ class _MacReceiverHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
 
-        target_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+        except (FileExistsError, NotADirectoryError, IsADirectoryError) as exc:
+            logger.warning("Destination path conflict for %s: %s", target_path, exc)
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "destination path conflict"})
+            return
+        except OSError as exc:
+            logger.error("Failed creating destination directory for %s: %s", target_path, exc)
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "write_failed"})
+            return
+
         part_path = target_path.parent / f".cp0-{uuid.uuid4().hex}.part"
 
         try:
             computed_sha = self._stream_to_part(part_path, content_length)
         except _PrematureDisconnectError:
             part_path.unlink(missing_ok=True)
+            self.close_connection = True
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "incomplete request body"})
+            return
+        except (FileExistsError, NotADirectoryError, IsADirectoryError) as exc:
+            part_path.unlink(missing_ok=True)
+            logger.warning("Destination path conflict writing %s: %s", part_path, exc)
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "destination path conflict"})
             return
         except OSError as exc:
             part_path.unlink(missing_ok=True)
             logger.error("Failed writing upload part file %s: %s", part_path, exc)
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "write_failed"})
+            return
+
+        if computed_sha is None:
             return
 
         if computed_sha != expected_sha:
@@ -244,26 +270,47 @@ class _MacReceiverHandler(BaseHTTPRequestHandler):
             return
 
         server: MacReceiverServer = self.server  # type: ignore[assignment]
-        status, saved_path = server.commit_part(part_path, target_path, expected_sha, mtime, cfg)
+        try:
+            status, saved_path = server.commit_part(part_path, target_path, expected_sha, mtime, cfg)
+        except (FileExistsError, NotADirectoryError, IsADirectoryError) as exc:
+            part_path.unlink(missing_ok=True)
+            logger.warning("Destination path conflict committing %s: %s", target_path, exc)
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "destination path conflict"})
+            return
+        except OSError as exc:
+            part_path.unlink(missing_ok=True)
+            logger.error("Failed committing upload %s: %s", target_path, exc)
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "commit_failed"})
+            return
+
         if status == "already_exists":
             self._send_json(HTTPStatus.OK, {"status": "already_exists"})
             return
 
         self._send_json(HTTPStatus.OK, {"status": "saved", "saved_path": str(saved_path)})
 
-    def _stream_to_part(self, part_path: Path, content_length: int) -> str:
+    def _stream_to_part(self, part_path: Path, content_length: int) -> str | None:
         digest = hashlib.sha256()
         remaining = content_length
-        with open(part_path, "wb") as handle:
-            while remaining > 0:
-                chunk = self.rfile.read(min(CHUNK_SIZE, remaining))
-                if not chunk:
-                    raise _PrematureDisconnectError()
-                handle.write(chunk)
-                digest.update(chunk)
-                remaining -= len(chunk)
-            handle.flush()
-            os.fsync(handle.fileno())
+        try:
+            with open(part_path, "wb") as handle:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(CHUNK_SIZE, remaining))
+                    if not chunk:
+                        raise _PrematureDisconnectError()
+                    handle.write(chunk)
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except (TimeoutError, socket.timeout):
+            part_path.unlink(missing_ok=True)
+            self.close_connection = True
+            self._send_json(
+                HTTPStatus.REQUEST_TIMEOUT,
+                {"ok": False, "error": "Upload timed out"},
+            )
+            return None
         return digest.hexdigest()
 
 
@@ -293,7 +340,7 @@ class MacReceiverServer(ThreadingHTTPServer):
         self._commit_lock = threading.Lock()
         self._notify_lock = threading.Lock()
         self._pending_count = 0
-        self._pending_dest = Path(cfg.dest_root)
+        self._pending_dest = Path(cfg.dest_root).expanduser()
         self._notify_timer: threading.Timer | None = None
         self._server_thread: threading.Thread | None = None
 
@@ -375,12 +422,16 @@ class MacReceiverServer(ThreadingHTTPServer):
                             return ("already_exists", None)
                         index += 1
 
+                try:
+                    os.utime(part_path, (mtime, mtime))
+                except OSError as exc:
+                    logger.warning("Failed to set mtime on %s: %s", part_path, exc)
+
                 os.replace(part_path, final_path)
         except BaseException:
             part_path.unlink(missing_ok=True)
             raise
 
-        os.utime(final_path, (mtime, mtime))
         logger.info("Saved photo %s", final_path)
         if cfg.notify_on_batch:
             self._schedule_notification(Path(cfg.dest_root).expanduser())

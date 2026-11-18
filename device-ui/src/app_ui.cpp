@@ -785,7 +785,7 @@ struct LvglAppView::Impl {
         uint32_t badge_border = pal.border;
         bool hollow = false;
 
-        if (!state.status.ok) {
+        if (!state.status.ok || state.status.from_fallback) {
             badge_text = "Daemon Off";
             badge_bg = pal.status_error_bg;
             badge_fg = pal.status_error;
