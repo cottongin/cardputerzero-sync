@@ -1,0 +1,10 @@
+.superpowers/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+build/
+device-ui/build/
+device-ui/deps/
+*.deb
+.DS_Store
