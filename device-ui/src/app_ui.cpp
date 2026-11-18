@@ -713,10 +713,38 @@ struct LvglAppView::Impl {
 
 #if defined(CP0_HAS_LVGL)
     lv_obj_t* screen = nullptr;
-    lv_style_t style_bg;
-    lv_style_t style_card;
+    lv_style_t style_bg{};
+    lv_style_t style_card{};
     bool lvgl_styles_inited = false;
+
+    void sync_lvgl_styles() {
+        if (!lv_is_initialized()) {
+            lv_init();
+        }
+        if (!lvgl_styles_inited) {
+            lv_style_init(&style_bg);
+            lv_style_init(&style_card);
+            lvgl_styles_inited = true;
+        }
+        lv_style_set_bg_color(&style_bg, lv_color_hex(pal.background));
+        lv_style_set_bg_color(&style_card, lv_color_hex(pal.card));
+        lv_style_set_border_color(&style_card, lv_color_hex(pal.border));
+        if (screen != nullptr) {
+            lv_obj_report_style_change(&style_bg);
+            lv_obj_report_style_change(&style_card);
+        }
+    }
 #endif
+
+    ~Impl() {
+#if defined(CP0_HAS_LVGL)
+        if (lvgl_styles_inited) {
+            lv_style_reset(&style_bg);
+            lv_style_reset(&style_card);
+            lvgl_styles_inited = false;
+        }
+#endif
+    }
 
     void render_top_bar(const UiState& state) {
         // Segmented TabsList pill container (radius 5px, padding 2px)
@@ -887,14 +915,14 @@ struct LvglAppView::Impl {
 
         std::string footer_msg;
         uint32_t footer_color = pal.muted_foreground;
-        if (!state.feedback_banner.empty()) {
-            footer_msg = state.feedback_banner;
-            footer_color = pal.status_online;
-        } else if (state.status.syncing && !state.status.current_file.empty()) {
+        if (state.status.syncing && !state.status.current_file.empty()) {
             footer_msg = "File: " + state.status.current_file;
             footer_color = pal.foreground;
         } else if (!state.status.last_error.empty() && state.status.last_error != "none") {
             footer_msg = "Err: " + state.status.last_error;
+            footer_color = pal.status_error;
+        } else if (!state.status.ok && !state.status.error.empty()) {
+            footer_msg = state.status.error;
             footer_color = pal.status_error;
         } else if (!state.status.last_synced_file.empty()) {
             footer_msg = "Last sync: " + state.status.last_synced_file;
@@ -1279,6 +1307,18 @@ struct LvglAppView::Impl {
         }
     }
 
+    void render_feedback_toast(const UiState& state) {
+        if (state.modal != ModalKind::None || state.feedback_banner.empty()) {
+            return;
+        }
+        uint32_t bg = state.feedback_is_error ? pal.status_error_bg : pal.status_online_bg;
+        uint32_t fg = state.feedback_is_error ? pal.status_error : pal.status_online;
+        canvas.draw_round_box(6, 129, 308, 19, 5, bg, fg, 1);
+        canvas.draw_circle(15.0f, 138.5f, 2.5f, fg, false);
+        std::string fit = canvas.truncate_right(FontRole::Mono, 9, state.feedback_banner, 282);
+        canvas.draw_text(FontRole::Mono, 9, 23, 134, fit, fg);
+    }
+
     void render(const UiState& state) {
         if (state.theme != theme) {
             theme = state.theme;
@@ -1299,22 +1339,12 @@ struct LvglAppView::Impl {
                 break;
         }
 
+        render_feedback_toast(state);
         render_modal(state);
         render_footer(state);
 
 #if defined(CP0_HAS_LVGL)
-        if (!lvgl_styles_inited) {
-            lv_style_init(&style_bg);
-            lv_style_init(&style_card);
-            lvgl_styles_inited = true;
-        }
-        lv_style_set_bg_color(&style_bg, lv_color_hex(pal.background));
-        lv_style_set_bg_color(&style_card, lv_color_hex(pal.card));
-        lv_style_set_border_color(&style_card, lv_color_hex(pal.border));
-        if (screen != nullptr) {
-            lv_obj_report_style_change(&style_bg);
-            lv_obj_report_style_change(&style_card);
-        }
+        sync_lvgl_styles();
 #endif
     }
 };
@@ -1325,6 +1355,9 @@ LvglAppView::~LvglAppView() = default;
 void LvglAppView::apply_theme(ThemeMode mode) {
     impl_->theme = mode;
     impl_->pal = get_palette(mode);
+#if defined(CP0_HAS_LVGL)
+    impl_->sync_lvgl_styles();
+#endif
 }
 
 void LvglAppView::render(const UiState& state) {

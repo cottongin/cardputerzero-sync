@@ -209,12 +209,14 @@ void UiController::set_dir_picker_start_path(const std::string& path) {
     dir_picker_start_path_ = path;
 }
 
-void UiController::set_feedback(const std::string& message) {
+void UiController::set_feedback(const std::string& message, bool is_error) {
     state_.feedback_banner = message;
+    state_.feedback_is_error = is_error && !message.empty();
 }
 
 void UiController::clear_feedback() {
     state_.feedback_banner.clear();
+    state_.feedback_is_error = false;
 }
 
 bool UiController::consume_peer_refresh() {
@@ -276,23 +278,24 @@ void UiController::load_directory(const std::string& path, const std::string& se
     state_.dir_current_path = resolved.string();
     state_.dir_entries.clear();
 
-    fs::directory_iterator it(
-        resolved,
-        fs::directory_options::skip_permission_denied,
-        ec
-    );
-    if (!ec) {
-        for (const auto& entry : it) {
-            std::error_code entry_ec;
-            if (!entry.is_directory(entry_ec) || entry_ec) {
-                continue;
-            }
-            std::string name = entry.path().filename().string();
-            if (name.empty() || name[0] == '.') {
-                continue;
-            }
-            state_.dir_entries.push_back(entry.path().string());
+    for (fs::directory_iterator it(
+             resolved,
+             fs::directory_options::skip_permission_denied,
+             ec
+         ),
+         end;
+         !ec && it != end;
+         it.increment(ec)) {
+        const auto& entry = *it;
+        std::error_code entry_ec;
+        if (!entry.is_directory(entry_ec) || entry_ec) {
+            continue;
         }
+        std::string name = entry.path().filename().string();
+        if (name.empty() || name[0] == '.') {
+            continue;
+        }
+        state_.dir_entries.push_back(entry.path().string());
     }
 
     std::sort(

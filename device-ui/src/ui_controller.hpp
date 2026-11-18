@@ -93,6 +93,7 @@ struct UiState {
     std::string text_buffer;
     std::string modal_error;
     std::string feedback_banner;
+    bool feedback_is_error = false;
 
     bool needs_peer_refresh = false;
 };
@@ -114,7 +115,7 @@ public:
     void set_dir_picker_start_path(const std::string& path);
 
     /// Set or clear transient status feedback displayed in the UI.
-    void set_feedback(const std::string& message);
+    void set_feedback(const std::string& message, bool is_error = false);
     void clear_feedback();
 
     /// Return true once when TargetPicker was opened and needs peer discovery.

@@ -1,9 +1,13 @@
+#include "fb_blit.hpp"
 #include "ui_controller.hpp"
 
 #include <unistd.h>
 
 #include <cassert>
 #include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -262,6 +266,24 @@ void test_target_picker_and_manual_host() {
     assert(no_peer_enter.type == cp0::ActionType::None);
     assert(ctrl.state().modal == cp0::ModalKind::TargetPicker);
     ctrl.handle_key(0, cp0::KeyCode::Escape);
+
+    // IPv6 host with port and without port
+    ctrl.handle_key('c', cp0::KeyCode::Char);
+    ctrl.handle_key('t', cp0::KeyCode::Char);
+    type_text(ctrl, "[::1]:8765");
+    auto ipv6_port = ctrl.handle_key(0, cp0::KeyCode::Enter);
+    assert(ipv6_port.type == cp0::ActionType::SetTarget);
+    assert(ipv6_port.target_host == "::1");
+    assert(ipv6_port.target_port == 8765);
+    assert(ctrl.state().modal == cp0::ModalKind::None);
+
+    ctrl.handle_key('c', cp0::KeyCode::Char);
+    ctrl.handle_key('t', cp0::KeyCode::Char);
+    type_text(ctrl, "[fd7a:115c:a1e0::1]");
+    auto ipv6_default = ctrl.handle_key(0, cp0::KeyCode::Enter);
+    assert(ipv6_default.type == cp0::ActionType::SetTarget);
+    assert(ipv6_default.target_host == "fd7a:115c:a1e0::1");
+    assert(ipv6_default.target_port == 8765);
 }
 
 void test_dir_picker_traversal_and_manual_path() {
@@ -333,6 +355,42 @@ void test_dir_picker_traversal_and_manual_path() {
     assert(add_manual.type == cp0::ActionType::AddFolder);
     assert(add_manual.folder_path == "/media/sd/DCIM2");
     assert(ctrl.state().modal == cp0::ModalKind::None);
+
+    // '.' inside DirPicker adds dir_current_path directly (even when a subdir is highlighted)
+    ctrl.handle_key('a', cp0::KeyCode::Char);
+    assert(ctrl.state().modal == cp0::ModalKind::DirPicker);
+    ctrl.handle_key('j', cp0::KeyCode::Char); // highlight beta
+    auto add_dot = ctrl.handle_key('.', cp0::KeyCode::Char);
+    assert(add_dot.type == cp0::ActionType::AddFolder);
+    assert(fs::path(add_dot.folder_path) == fs::weakly_canonical(root));
+    assert(ctrl.state().modal == cp0::ModalKind::None);
+
+    // '~' tilde path expansion in FolderPath TextInput
+    const char* raw_home = std::getenv("HOME");
+    bool had_home = (raw_home != nullptr);
+    std::string saved_home = had_home ? raw_home : "";
+    ::setenv("HOME", "/home/cp0user", 1);
+
+    ctrl.handle_key('a', cp0::KeyCode::Char);
+    ctrl.handle_key('t', cp0::KeyCode::Char);
+    type_text(ctrl, "~/Pictures/Camera");
+    auto add_tilde = ctrl.handle_key(0, cp0::KeyCode::Enter);
+    assert(add_tilde.type == cp0::ActionType::AddFolder);
+    assert(add_tilde.folder_path == "/home/cp0user/Pictures/Camera");
+    assert(ctrl.state().modal == cp0::ModalKind::None);
+
+    ctrl.handle_key('a', cp0::KeyCode::Char);
+    ctrl.handle_key('t', cp0::KeyCode::Char);
+    type_text(ctrl, "~");
+    auto add_tilde_home = ctrl.handle_key(0, cp0::KeyCode::Enter);
+    assert(add_tilde_home.type == cp0::ActionType::AddFolder);
+    assert(add_tilde_home.folder_path == "/home/cp0user");
+
+    if (had_home) {
+        ::setenv("HOME", saved_home.c_str(), 1);
+    } else {
+        ::unsetenv("HOME");
+    }
 }
 
 void test_folders_selection_and_confirm_remove() {
@@ -432,6 +490,152 @@ void test_logs_scrolling_and_retry_failed() {
     assert(retry.type == cp0::ActionType::RetryFailed);
 }
 
+void test_feedback_banner_and_error_flag() {
+    cp0::UiController ctrl;
+    assert(ctrl.state().feedback_banner.empty());
+    assert(ctrl.state().feedback_is_error == false);
+
+    ctrl.set_feedback("Sync triggered");
+    assert(ctrl.state().feedback_banner == "Sync triggered");
+    assert(ctrl.state().feedback_is_error == false);
+
+    ctrl.set_feedback("Daemon unreachable", true);
+    assert(ctrl.state().feedback_banner == "Daemon unreachable");
+    assert(ctrl.state().feedback_is_error == true);
+
+    ctrl.set_feedback("Folder added");
+    assert(ctrl.state().feedback_banner == "Folder added");
+    assert(ctrl.state().feedback_is_error == false);
+
+    ctrl.set_feedback("", true);
+    assert(ctrl.state().feedback_banner.empty());
+    assert(ctrl.state().feedback_is_error == false);
+
+    ctrl.set_feedback("Failed", true);
+    assert(ctrl.state().feedback_is_error == true);
+    ctrl.clear_feedback();
+    assert(ctrl.state().feedback_banner.empty());
+    assert(ctrl.state().feedback_is_error == false);
+}
+
+void test_fb_blit_pixel_formats_and_bounds() {
+    const uint32_t src[4] = {
+        0xff123456U, 0xfff80000U,
+        0xff00fc00U, 0xff0000f8U,
+    };
+
+    // 32-bit XRGB8888 fast path with xoffset/yoffset and padded stride
+    {
+        cp0::FbBlitSpec spec;
+        spec.xres = 2;
+        spec.yres = 2;
+        spec.xoffset = 1;
+        spec.yoffset = 1;
+        spec.bits_per_pixel = 32;
+        spec.line_length = 16; // 4 pixels per scanline
+        spec.red = {16, 8};
+        spec.green = {8, 8};
+        spec.blue = {0, 8};
+
+        std::vector<uint8_t> buf(48, 0xaa);
+        assert(cp0::blit_framebuffer(buf.data(), buf.size(), spec, src, 2, 2));
+        uint32_t p00 = 0;
+        uint32_t p11 = 0;
+        std::memcpy(&p00, buf.data() + 1 * 16 + 1 * 4, 4);
+        std::memcpy(&p11, buf.data() + 2 * 16 + 2 * 4, 4);
+        assert(p00 == 0xff123456U);
+        assert(p11 == 0xff0000f8U);
+        assert(buf[0] == 0xaa);
+    }
+
+    // 32-bit XBGR8888 (red/blue swapped in fb layout)
+    {
+        cp0::FbBlitSpec spec;
+        spec.xres = 2;
+        spec.yres = 2;
+        spec.bits_per_pixel = 32;
+        spec.line_length = 8;
+        spec.red = {0, 8};
+        spec.green = {8, 8};
+        spec.blue = {16, 8};
+
+        std::vector<uint8_t> buf(16, 0);
+        assert(cp0::blit_framebuffer(buf.data(), buf.size(), spec, src, 2, 2));
+        uint32_t p00 = 0;
+        std::memcpy(&p00, buf.data(), 4);
+        assert(p00 == 0x00563412U);
+    }
+
+    // 16-bit RGB565 & BGR565 with odd stride
+    {
+        cp0::FbBlitSpec spec;
+        spec.xres = 2;
+        spec.yres = 2;
+        spec.bits_per_pixel = 16;
+        spec.line_length = 5; // odd byte stride >= 4
+        spec.red = {11, 5};
+        spec.green = {5, 6};
+        spec.blue = {0, 5};
+
+        std::vector<uint8_t> buf(10, 0);
+        assert(cp0::blit_framebuffer(buf.data(), buf.size(), spec, src, 2, 2));
+        uint16_t p01 = 0; // pure red 0xfff80000 -> 0xf800
+        uint16_t p10 = 0; // pure green 0xff00fc00 -> 0x07e0
+        std::memcpy(&p01, buf.data() + 2, 2);
+        std::memcpy(&p10, buf.data() + 5, 2);
+        assert(p01 == 0xf800U);
+        assert(p10 == 0x07e0U);
+
+        spec.red = {0, 5};
+        spec.blue = {11, 5};
+        assert(cp0::blit_framebuffer(buf.data(), buf.size(), spec, src, 2, 2));
+        std::memcpy(&p01, buf.data() + 2, 2);
+        assert(p01 == 0x001fU);
+    }
+
+    // 24-bit BGR888
+    {
+        cp0::FbBlitSpec spec;
+        spec.xres = 2;
+        spec.yres = 2;
+        spec.bits_per_pixel = 24;
+        spec.line_length = 6;
+        spec.red = {0, 8};
+        spec.green = {8, 8};
+        spec.blue = {16, 8};
+
+        std::vector<uint8_t> buf(12, 0);
+        assert(cp0::blit_framebuffer(buf.data(), buf.size(), spec, src, 2, 2));
+        assert(buf[0] == 0x12 && buf[1] == 0x34 && buf[2] == 0x56);
+    }
+
+    // Bounds & invalid format checks (canary byte after map_size untouched)
+    {
+        cp0::FbBlitSpec spec;
+        spec.xres = 2;
+        spec.yres = 2;
+        spec.bits_per_pixel = 16;
+        spec.line_length = 4;
+        spec.red = {11, 5};
+        spec.green = {5, 6};
+        spec.blue = {0, 5};
+
+        std::vector<uint8_t> buf(8, 0x55);
+        // Only 6 bytes mapped, so row 1 (bytes 4..7) overflows map_size
+        assert(!cp0::blit_framebuffer(buf.data(), 6, spec, src, 2, 2));
+        assert(buf[6] == 0x55 && buf[7] == 0x55);
+
+        // Stride smaller than row_bytes rejected
+        spec.line_length = 3;
+        assert(!cp0::blit_framebuffer(buf.data(), buf.size(), spec, src, 2, 2));
+
+        // Unsupported bpp rejected
+        spec.line_length = 4;
+        spec.bits_per_pixel = 8;
+        assert(!cp0::blit_framebuffer(buf.data(), buf.size(), spec, src, 2, 2));
+    }
+}
+
 } // namespace
 
 int main() {
@@ -441,6 +645,8 @@ int main() {
     test_dir_picker_traversal_and_manual_path();
     test_folders_selection_and_confirm_remove();
     test_logs_scrolling_and_retry_failed();
+    test_feedback_banner_and_error_flag();
+    test_fb_blit_pixel_formats_and_bounds();
     std::cout << "All test_ui_navigation assertions passed.\n";
     return 0;
 }

@@ -1,9 +1,14 @@
 #include "app_ui.hpp"
+#include "fb_blit.hpp"
 #include "ipc_client.hpp"
 #include "ui_controller.hpp"
 
+#include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -101,8 +106,8 @@ bool dispatch_action(
         return false;
     }
 
-    auto set_timed_feedback = [&](const std::string& msg) {
-        ctrl.set_feedback(msg);
+    auto set_timed_feedback = [&](const std::string& msg, bool is_error) {
+        ctrl.set_feedback(msg, is_error);
         feedback_until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     };
 
@@ -112,25 +117,38 @@ bool dispatch_action(
             return true;
         case ActionType::SyncNow: {
             auto res = ipc.sync_now();
-            set_timed_feedback(res.ok ? "Sync triggered" : res.error);
+            set_timed_feedback(
+                res.ok ? "Sync triggered" : (res.error.empty() ? "Sync failed" : res.error),
+                !res.ok
+            );
             ctrl.update_status(ipc.fetch_status());
             return true;
         }
         case ActionType::AddFolder: {
             auto res = ipc.add_folder(action.folder_path, action.folder_label);
-            set_timed_feedback(res.ok ? "Folder added" : res.error);
+            set_timed_feedback(
+                res.ok ? "Folder added" : (res.error.empty() ? "Add folder failed" : res.error),
+                !res.ok
+            );
             ctrl.update_status(ipc.fetch_status());
             return true;
         }
         case ActionType::RemoveFolder: {
             auto res = ipc.remove_folder(action.folder_id);
-            set_timed_feedback(res.ok ? "Folder removed" : res.error);
+            set_timed_feedback(
+                res.ok ? "Folder removed" : (res.error.empty() ? "Remove folder failed" : res.error),
+                !res.ok
+            );
             ctrl.update_status(ipc.fetch_status());
             return true;
         }
         case ActionType::SetTarget: {
             auto res = ipc.set_target(action.target_host, action.target_port);
-            set_timed_feedback(res.ok ? ("Target: " + action.target_host) : res.error);
+            set_timed_feedback(
+                res.ok ? ("Target: " + action.target_host)
+                       : (res.error.empty() ? "Set target failed" : res.error),
+                !res.ok
+            );
             ctrl.update_status(ipc.fetch_status());
             return true;
         }
@@ -141,7 +159,10 @@ bool dispatch_action(
         }
         case ActionType::RetryFailed: {
             auto res = ipc.retry_failed();
-            set_timed_feedback(res.ok ? "Retrying failed files" : res.error);
+            set_timed_feedback(
+                res.ok ? "Retrying failed files" : (res.error.empty() ? "Retry failed" : res.error),
+                !res.ok
+            );
             ctrl.update_status(ipc.fetch_status());
             return true;
         }
@@ -201,40 +222,36 @@ char map_evdev_code(uint16_t code, bool shift) {
         case KEY_DOT: return shift ? '>' : '.';
         case KEY_SLASH: return shift ? '?' : '/';
         case KEY_BACKSLASH: return shift ? '|' : '\\';
+        case KEY_GRAVE: return shift ? '~' : '`';
         default: return 0;
     }
 }
 
 void blit_fbdev(
     uint8_t* fb_mem,
+    size_t map_size,
     const fb_var_screeninfo& vinfo,
     const fb_fix_screeninfo& finfo,
     const uint32_t* pixels
 ) {
-    int fb_w = static_cast<int>(vinfo.xres);
-    int fb_h = static_cast<int>(vinfo.yres);
-    int copy_w = std::min(fb_w, cp0::LvglAppView::kWidth);
-    int copy_h = std::min(fb_h, cp0::LvglAppView::kHeight);
-    int bpp = static_cast<int>(vinfo.bits_per_pixel);
-    int stride = static_cast<int>(finfo.line_length);
-
-    for (int y = 0; y < copy_h; ++y) {
-        uint8_t* row = fb_mem + (y + static_cast<int>(vinfo.yoffset)) * stride +
-                       static_cast<int>(vinfo.xoffset) * (bpp / 8);
-        const uint32_t* src = pixels + y * cp0::LvglAppView::kWidth;
-        if (bpp == 32) {
-            std::memcpy(row, src, static_cast<size_t>(copy_w) * 4);
-        } else if (bpp == 16) {
-            auto* dst16 = reinterpret_cast<uint16_t*>(row);
-            for (int x = 0; x < copy_w; ++x) {
-                uint32_t c = src[x];
-                uint16_t r = static_cast<uint16_t>((c >> 19) & 0x1fU);
-                uint16_t g = static_cast<uint16_t>((c >> 10) & 0x3fU);
-                uint16_t b = static_cast<uint16_t>((c >> 3) & 0x1fU);
-                dst16[x] = static_cast<uint16_t>((r << 11) | (g << 5) | b);
-            }
-        }
-    }
+    cp0::FbBlitSpec spec;
+    spec.xres = vinfo.xres;
+    spec.yres = vinfo.yres;
+    spec.xoffset = vinfo.xoffset;
+    spec.yoffset = vinfo.yoffset;
+    spec.bits_per_pixel = vinfo.bits_per_pixel;
+    spec.line_length = finfo.line_length;
+    spec.red = {vinfo.red.offset, vinfo.red.length};
+    spec.green = {vinfo.green.offset, vinfo.green.length};
+    spec.blue = {vinfo.blue.offset, vinfo.blue.length};
+    cp0::blit_framebuffer(
+        fb_mem,
+        map_size,
+        spec,
+        pixels,
+        cp0::LvglAppView::kWidth,
+        cp0::LvglAppView::kHeight
+    );
 }
 
 std::vector<int> open_keyboard_evdevs() {
@@ -294,6 +311,11 @@ int run_device_loop(cp0::IpcClient& ipc, cp0::UiController& ctrl, cp0::LvglAppVi
     }
 
     size_t map_size = finfo.smem_len;
+    if (map_size == 0) {
+        std::cerr << "Framebuffer reports zero memory length\n";
+        ::close(fb_fd);
+        return 1;
+    }
     void* mapped = ::mmap(nullptr, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fb_fd, 0);
     if (mapped == MAP_FAILED) {
         std::cerr << "Failed to mmap framebuffer\n";
@@ -312,7 +334,7 @@ int run_device_loop(cp0::IpcClient& ipc, cp0::UiController& ctrl, cp0::LvglAppVi
     ctrl.update_status(ipc.fetch_status());
     view.apply_theme(ctrl.state().theme);
     view.render(ctrl.state());
-    blit_fbdev(fb_mem, vinfo, finfo, view.pixels());
+    blit_fbdev(fb_mem, map_size, vinfo, finfo, view.pixels());
 
     bool running = true;
     bool shift_down = false;
@@ -323,78 +345,115 @@ int run_device_loop(cp0::IpcClient& ipc, cp0::UiController& ctrl, cp0::LvglAppVi
         bool dirty = false;
         if (!pfds.empty()) {
             int prc = ::poll(pfds.data(), static_cast<nfds_t>(pfds.size()), 50);
-            if (prc > 0) {
-                for (const auto& p : pfds) {
-                    if ((p.revents & POLLIN) == 0) {
-                        continue;
-                    }
-                    struct input_event ev{};
-                    while (::read(p.fd, &ev, sizeof(ev)) == sizeof(ev)) {
-                        if (ev.type != EV_KEY) {
-                            continue;
-                        }
-                        if (ev.code == KEY_LEFTSHIFT || ev.code == KEY_RIGHTSHIFT) {
-                            shift_down = (ev.value != 0);
-                            continue;
-                        }
-                        if (ev.value != 1 && ev.value != 2) {
-                            continue;
-                        }
-                        cp0::IpcAction act;
-                        bool handled = true;
-                        switch (ev.code) {
-                            case KEY_UP:
-                                act = ctrl.handle_key(0, cp0::KeyCode::Up);
-                                break;
-                            case KEY_DOWN:
-                                act = ctrl.handle_key(0, cp0::KeyCode::Down);
-                                break;
-                            case KEY_LEFT:
-                                act = ctrl.handle_key(0, cp0::KeyCode::Left);
-                                break;
-                            case KEY_RIGHT:
-                                act = ctrl.handle_key(0, cp0::KeyCode::Right);
-                                break;
-                            case KEY_ENTER:
-                            case KEY_KPENTER:
-                                act = ctrl.handle_key(0, cp0::KeyCode::Enter);
-                                break;
-                            case KEY_ESC:
-                                act = ctrl.handle_key(0, cp0::KeyCode::Escape);
-                                break;
-                            case KEY_BACKSPACE:
-                                act = ctrl.handle_key(0, cp0::KeyCode::Backspace);
-                                break;
-                            case KEY_DELETE:
-                                act = ctrl.handle_key(0, cp0::KeyCode::Delete);
-                                break;
-                            case KEY_SPACE:
-                                act = ctrl.handle_key(' ', cp0::KeyCode::Space);
-                                break;
-                            default: {
-                                char c = map_evdev_code(ev.code, shift_down);
-                                if (c != 0) {
-                                    act = ctrl.handle_key(c, cp0::KeyCode::Char);
-                                } else {
-                                    handled = false;
+            if (prc < 0) {
+                if (errno != EINTR) {
+                    ::usleep(50000);
+                }
+            } else if (prc > 0) {
+                std::vector<size_t> dead_indices;
+                for (size_t idx = 0; idx < pfds.size() && running && !g_signal_stop; ++idx) {
+                    const auto& p = pfds[idx];
+                    bool remove_fd = (p.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0;
+                    if ((p.revents & POLLIN) != 0) {
+                        while (running && !g_signal_stop) {
+                            struct input_event ev{};
+                            ssize_t n = ::read(p.fd, &ev, sizeof(ev));
+                            if (n < 0) {
+                                if (errno == EINTR) {
+                                    continue;
                                 }
+                                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                    break;
+                                }
+                                remove_fd = true;
                                 break;
                             }
-                        }
-                        if (handled) {
-                            dirty = true;
-                            if (ctrl.consume_peer_refresh()) {
-                                ctrl.set_peers(ipc.list_tailscale_peers());
+                            if (n == 0) {
+                                remove_fd = true;
+                                break;
                             }
-                            dispatch_action(ipc, ctrl, view, act, running, feedback_until);
+                            if (n != static_cast<ssize_t>(sizeof(ev))) {
+                                break;
+                            }
+                            if (ev.type != EV_KEY) {
+                                continue;
+                            }
+                            if (ev.code == KEY_LEFTSHIFT || ev.code == KEY_RIGHTSHIFT) {
+                                shift_down = (ev.value != 0);
+                                continue;
+                            }
+                            if (ev.value != 1 && ev.value != 2) {
+                                continue;
+                            }
+                            cp0::IpcAction act;
+                            bool handled = true;
+                            switch (ev.code) {
+                                case KEY_UP:
+                                    act = ctrl.handle_key(0, cp0::KeyCode::Up);
+                                    break;
+                                case KEY_DOWN:
+                                    act = ctrl.handle_key(0, cp0::KeyCode::Down);
+                                    break;
+                                case KEY_LEFT:
+                                    act = ctrl.handle_key(0, cp0::KeyCode::Left);
+                                    break;
+                                case KEY_RIGHT:
+                                    act = ctrl.handle_key(0, cp0::KeyCode::Right);
+                                    break;
+                                case KEY_ENTER:
+                                case KEY_KPENTER:
+                                    act = ctrl.handle_key(0, cp0::KeyCode::Enter);
+                                    break;
+                                case KEY_ESC:
+                                    act = ctrl.handle_key(0, cp0::KeyCode::Escape);
+                                    break;
+                                case KEY_BACKSPACE:
+                                    act = ctrl.handle_key(0, cp0::KeyCode::Backspace);
+                                    break;
+                                case KEY_DELETE:
+                                    act = ctrl.handle_key(0, cp0::KeyCode::Delete);
+                                    break;
+                                case KEY_SPACE:
+                                    act = ctrl.handle_key(' ', cp0::KeyCode::Space);
+                                    break;
+                                default: {
+                                    char c = map_evdev_code(ev.code, shift_down);
+                                    if (c != 0) {
+                                        act = ctrl.handle_key(c, cp0::KeyCode::Char);
+                                    } else {
+                                        handled = false;
+                                    }
+                                    break;
+                                }
+                            }
+                            if (handled) {
+                                dirty = true;
+                                if (ctrl.consume_peer_refresh()) {
+                                    ctrl.set_peers(ipc.list_tailscale_peers());
+                                }
+                                dispatch_action(ipc, ctrl, view, act, running, feedback_until);
+                                if (!running || g_signal_stop) {
+                                    break;
+                                }
+                            }
                         }
                     }
+                    if (remove_fd) {
+                        ::close(p.fd);
+                        dead_indices.push_back(idx);
+                    }
+                }
+                for (auto it = dead_indices.rbegin(); it != dead_indices.rend(); ++it) {
+                    pfds.erase(pfds.begin() + static_cast<std::ptrdiff_t>(*it));
                 }
             }
         } else {
             ::usleep(50000);
         }
 
+        if (!running || g_signal_stop) {
+            break;
+        }
         auto now = std::chrono::steady_clock::now();
         if (!ctrl.state().feedback_banner.empty() && now >= feedback_until) {
             ctrl.clear_feedback();
@@ -405,14 +464,14 @@ int run_device_loop(cp0::IpcClient& ipc, cp0::UiController& ctrl, cp0::LvglAppVi
             last_poll = now;
             dirty = true;
         }
-        if (dirty) {
+        if (running && !g_signal_stop && dirty) {
             view.render(ctrl.state());
-            blit_fbdev(fb_mem, vinfo, finfo, view.pixels());
+            blit_fbdev(fb_mem, map_size, vinfo, finfo, view.pixels());
         }
     }
 
-    for (int fd : ev_fds) {
-        ::close(fd);
+    for (const auto& p : pfds) {
+        ::close(p.fd);
     }
     ::munmap(mapped, map_size);
     ::close(fb_fd);
@@ -516,7 +575,7 @@ int run_sdl_loop(
                     continue;
                 }
                 if (ev.type == SDL_TEXTINPUT) {
-                    for (int i = 0; ev.text.text[i] != '\0'; ++i) {
+                    for (int i = 0; running && !g_signal_stop && ev.text.text[i] != '\0'; ++i) {
                         char ch = ev.text.text[i];
                         cp0::IpcAction act = ctrl.handle_key(ch, cp0::KeyCode::Char);
                         dirty = true;
@@ -577,6 +636,9 @@ int run_sdl_loop(
             } while (running && SDL_PollEvent(&ev) != 0);
         }
 
+        if (!running || g_signal_stop) {
+            break;
+        }
         auto now = std::chrono::steady_clock::now();
         if (!ctrl.state().feedback_banner.empty() && now >= feedback_until) {
             ctrl.clear_feedback();
@@ -587,7 +649,7 @@ int run_sdl_loop(
             last_poll = now;
             dirty = true;
         }
-        if (running && dirty) {
+        if (running && !g_signal_stop && dirty) {
             view.render(ctrl.state());
             present();
         }
