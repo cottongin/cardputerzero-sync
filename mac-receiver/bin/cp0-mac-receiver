@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Daemon entrypoint for the CardputerZero Mac photo receiver."""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import signal
+import sys
+import threading
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+
+def _ensure_package_on_path() -> None:
+    package_root = str(Path(os.path.realpath(__file__)).resolve().parents[1])
+    if package_root not in sys.path:
+        sys.path.insert(0, package_root)
+
+
+_ensure_package_on_path()
+
+from cp0_mac_receiver.cli import LOG_BACKUP_COUNT, LOG_MAX_BYTES, default_log_path  # noqa: E402
+from cp0_mac_receiver.config import default_config_path, load_mac_config  # noqa: E402
+from cp0_mac_receiver.server import MacReceiverServer  # noqa: E402
+
+
+def _configure_logging(log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(
+        log_path,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    handler.setFormatter(formatter)
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+    root.addHandler(handler)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Run the CardputerZero Mac HTTP photo receiver.")
+    parser.add_argument("--config", type=Path, default=None, help="Path to config.json.")
+    parser.add_argument("--log-file", type=Path, default=None, help="Path to rotating log file.")
+    args = parser.parse_args(argv)
+
+    cfg_path = args.config.expanduser() if args.config is not None else default_config_path()
+    log_path = args.log_file.expanduser() if args.log_file is not None else default_log_path()
+    _configure_logging(log_path)
+
+    cfg = load_mac_config(cfg_path)
+    Path(cfg.dest_root).expanduser().mkdir(parents=True, exist_ok=True)
+
+    server = MacReceiverServer(config_path=cfg_path)
+    stop_event = threading.Event()
+
+    def _handle_signal(signum: int, _frame: object) -> None:
+        logging.getLogger(__name__).info("Received signal %s; shutting down", signum)
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
+    logging.getLogger(__name__).info(
+        "Starting MacReceiverServer on %s:%d (dest_root=%s)",
+        cfg.listen_host,
+        server.server_port,
+        cfg.dest_root,
+    )
+    server.start()
+    try:
+        stop_event.wait()
+    finally:
+        server.shutdown()
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
